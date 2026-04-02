@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -78,6 +80,16 @@ class State:
     x: float
     y: float
     theta_deg: int
+
+
+@dataclass
+class SearchResult:
+    found: bool
+    path: List[State]
+    explored_edges: List[Tuple[State, State]]
+    runtime_sec: float
+    explored_count: int
+    reached_state: Optional[State]
 
 
 def wrap_theta_deg(theta_deg: float) -> int:
@@ -347,6 +359,72 @@ def generate_predecessors(current: State, step_size: float) -> Iterable[State]:
         yield State(prev_x, prev_y, prev_theta)
 
 
+def backtrack_path(
+    reached_key: Tuple[int, int, int],
+    parent: Dict[Tuple[int, int, int], Tuple[int, int, int]],
+    key_to_state: Dict[Tuple[int, int, int], State],
+) -> List[State]:
+    path = [key_to_state[reached_key]]
+    current_key = reached_key
+    while current_key in parent:
+        current_key = parent[current_key]
+        path.append(key_to_state[current_key])
+    return path
+
+
+def backward_astar(start: State, goal: State, obstacle_map: ObstacleMap, step_size: float) -> SearchResult:
+    t0 = time.perf_counter()
+
+    open_heap: List[Tuple[float, float, Tuple[int, int, int], State]] = []
+    goal_key = state_to_index(goal)
+    heapq.heappush(open_heap, (euclidean_distance_xy(goal, start), 0.0, goal_key, goal))
+
+    parent: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+    best_g: Dict[Tuple[int, int, int], float] = {goal_key: 0.0}
+    key_to_state: Dict[Tuple[int, int, int], State] = {goal_key: goal}
+    closed = np.zeros((int(MAP_HEIGHT / XY_RESOLUTION), int(MAP_WIDTH / XY_RESOLUTION), THETA_BINS), dtype=np.uint8)
+    explored_edges: List[Tuple[State, State]] = []
+    explored_count = 0
+
+    while open_heap:
+        _, g_cost, current_key, current_state = heapq.heappop(open_heap)
+        iy, ix, it = current_key
+        if closed[iy, ix, it]:
+            continue
+
+        closed[iy, ix, it] = 1
+        explored_count += 1
+
+        if state_reaches_target(current_state, start):
+            key_to_state[current_key] = current_state
+            path = backtrack_path(current_key, parent, key_to_state)
+            runtime = time.perf_counter() - t0
+            return SearchResult(True, path, explored_edges, runtime, explored_count, current_state)
+
+        for predecessor in generate_predecessors(current_state, step_size):
+            if not obstacle_map.is_motion_valid(predecessor, current_state):
+                continue
+
+            predecessor_key = state_to_index(predecessor)
+            piy, pix, pit = predecessor_key
+            if closed[piy, pix, pit]:
+                continue
+
+            new_g = g_cost + step_size
+            if new_g >= best_g.get(predecessor_key, float("inf")):
+                continue
+
+            best_g[predecessor_key] = new_g
+            parent[predecessor_key] = current_key
+            key_to_state[predecessor_key] = predecessor
+            heuristic = euclidean_distance_xy(predecessor, start)
+            heapq.heappush(open_heap, (new_g + heuristic, new_g, predecessor_key, predecessor))
+            explored_edges.append((predecessor, current_state))
+
+    runtime = time.perf_counter() - t0
+    return SearchResult(False, [], explored_edges, runtime, explored_count, None)
+
+
 def validate_state(state: State, obstacle_map: ObstacleMap, name: str) -> None:
     if not obstacle_map.is_in_bounds(state.x, state.y):
         raise ValueError(f"{name} must lie inside the map bounds.")
@@ -394,7 +472,7 @@ def ask_positive_value(prompt: str, preset: Optional[float], low: float, high: f
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backward A* motion model setup for ENPM661 Project 03 - Phase 1")
+    parser = argparse.ArgumentParser(description="Backward A* search for ENPM661 Project 03 - Phase 1")
     parser.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="start state")
     parser.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="goal state")
     parser.add_argument("--robot-radius", type=float, default=DEFAULT_ROBOT_RADIUS, help="robot radius in map units")
@@ -425,19 +503,33 @@ def run() -> int:
         print(exc)
         return 1
 
-    sample_predecessors = list(generate_predecessors(goal, step_size))
+    result = backward_astar(start, goal, obstacle_map, step_size)
 
     print("=" * 78)
-    print("Obstacle map, discretization, and action model")
+    print("Backward A* search")
     print(f"Obstacle text       : {obstacle_map.text}")
     print(f"Robot radius        : {robot_radius}")
     print(f"Clearance           : {clearance}")
     print(f"Total inflation     : {total_clearance}")
     print(f"Step size           : {step_size}")
-    print(f"Start index         : {state_to_index(start)}")
-    print(f"Goal index          : {state_to_index(goal)}")
-    print(f"Sample predecessors : {len(sample_predecessors)}")
+    print(f"Start               : ({start.x:.2f}, {start.y:.2f}, {start.theta_deg})")
+    print(f"Goal                : ({goal.x:.2f}, {goal.y:.2f}, {goal.theta_deg})")
+    print(f"Goal threshold      : {GOAL_THRESHOLD}")
+    print(f"Path found          : {result.found}")
+    print(f"Nodes explored      : {result.explored_count}")
+    print(f"Runtime             : {result.runtime_sec:.6f} s")
+    print(f"Path length (nodes) : {len(result.path)}")
+    if result.reached_state is not None:
+        print(
+            "Reached state       : "
+            f"({result.reached_state.x:.2f}, {result.reached_state.y:.2f}, {result.reached_state.theta_deg})"
+        )
     print("=" * 78)
+
+    if result.found:
+        print("Path:")
+        for state in result.path:
+            print(f"({state.x:.2f}, {state.y:.2f}, {state.theta_deg})")
 
     return 0
 
