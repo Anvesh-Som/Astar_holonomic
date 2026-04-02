@@ -5,13 +5,16 @@ import argparse
 import math
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 MAP_WIDTH = 600
 MAP_HEIGHT = 250
+XY_RESOLUTION = 0.5
 THETA_RESOLUTION_DEG = 30
+THETA_BINS = 360 // THETA_RESOLUTION_DEG
+GOAL_THRESHOLD = 2.5
 DEFAULT_ROBOT_RADIUS = 5.0
 DEFAULT_CLEARANCE = 5.0
 DEFAULT_STEP_SIZE = 5.0
@@ -23,7 +26,8 @@ UNIFORM_SCALE = MAP_WIDTH / BASE_MAP_WIDTH
 VERTICAL_OFFSET = (MAP_HEIGHT - BASE_MAP_HEIGHT * UNIFORM_SCALE) / 2.0
 HORIZONTAL_OFFSET = 0.0
 
-Point = Tuple[float, float]
+ACTION_DELTAS_DEG: Tuple[int, ...] = (0, 30, 60, -30, -60)
+
 Rect = Tuple[float, float, float, float]
 Polygon = Sequence[Tuple[float, float]]
 EllipseRing = Tuple[float, float, float, float, float, float]
@@ -74,6 +78,10 @@ class State:
     x: float
     y: float
     theta_deg: int
+
+
+def wrap_theta_deg(theta_deg: float) -> int:
+    return int(round(theta_deg)) % 360
 
 
 def normalize_input_theta(theta_deg: int) -> int:
@@ -305,6 +313,39 @@ class ObstacleMap:
         iy = min(self.height - 1, max(0, int(round(y))))
         return not bool(self.bloated_mask[iy, ix])
 
+    def is_motion_valid(self, start: State, end: State) -> bool:
+        return self.is_free_point(start.x, start.y) and self.is_free_point(end.x, end.y)
+
+
+def quantize_xy(value: float, upper_bound: int) -> int:
+    index = int(round(value / XY_RESOLUTION))
+    return max(0, min(int(upper_bound / XY_RESOLUTION) - 1, index))
+
+
+def state_to_index(state: State) -> Tuple[int, int, int]:
+    iy = quantize_xy(state.y, MAP_HEIGHT)
+    ix = quantize_xy(state.x, MAP_WIDTH)
+    it = (state.theta_deg // THETA_RESOLUTION_DEG) % THETA_BINS
+    return (iy, ix, it)
+
+
+def euclidean_distance_xy(a: State, b: State) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def state_reaches_target(current: State, target: State) -> bool:
+    return euclidean_distance_xy(current, target) <= GOAL_THRESHOLD
+
+
+def generate_predecessors(current: State, step_size: float) -> Iterable[State]:
+    theta_rad = math.radians(current.theta_deg)
+    prev_x = current.x - step_size * math.cos(theta_rad)
+    prev_y = current.y - step_size * math.sin(theta_rad)
+
+    for delta_deg in ACTION_DELTAS_DEG:
+        prev_theta = wrap_theta_deg(current.theta_deg - delta_deg)
+        yield State(prev_x, prev_y, prev_theta)
+
 
 def validate_state(state: State, obstacle_map: ObstacleMap, name: str) -> None:
     if not obstacle_map.is_in_bounds(state.x, state.y):
@@ -353,7 +394,7 @@ def ask_positive_value(prompt: str, preset: Optional[float], low: float, high: f
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backward A* obstacle map setup for ENPM661 Project 03 - Phase 1")
+    parser = argparse.ArgumentParser(description="Backward A* motion model setup for ENPM661 Project 03 - Phase 1")
     parser.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="start state")
     parser.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="goal state")
     parser.add_argument("--robot-radius", type=float, default=DEFAULT_ROBOT_RADIUS, help="robot radius in map units")
@@ -384,15 +425,18 @@ def run() -> int:
         print(exc)
         return 1
 
+    sample_predecessors = list(generate_predecessors(goal, step_size))
+
     print("=" * 78)
-    print("Obstacle map and state validation")
+    print("Obstacle map, discretization, and action model")
     print(f"Obstacle text       : {obstacle_map.text}")
     print(f"Robot radius        : {robot_radius}")
     print(f"Clearance           : {clearance}")
     print(f"Total inflation     : {total_clearance}")
     print(f"Step size           : {step_size}")
-    print(f"Start               : ({start.x:.2f}, {start.y:.2f}, {start.theta_deg})")
-    print(f"Goal                : ({goal.x:.2f}, {goal.y:.2f}, {goal.theta_deg})")
+    print(f"Start index         : {state_to_index(start)}")
+    print(f"Goal index          : {state_to_index(goal)}")
+    print(f"Sample predecessors : {len(sample_predecessors)}")
     print("=" * 78)
 
     return 0
