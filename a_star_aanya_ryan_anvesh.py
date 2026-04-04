@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import heapq
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 MAP_WIDTH = 600
@@ -21,6 +23,8 @@ DEFAULT_ROBOT_RADIUS = 5.0
 DEFAULT_CLEARANCE = 5.0
 DEFAULT_STEP_SIZE = 5.0
 DEFAULT_TEXT = "TEAM 1"
+DEFAULT_FPS = 30
+DEFAULT_SCALE = 3
 
 BASE_MAP_WIDTH = 180.0
 BASE_MAP_HEIGHT = 50.0
@@ -196,6 +200,7 @@ class ObstacleMap:
 
         self.hard_mask = self._rasterize(clearance=0.0)
         self.bloated_mask = self._rasterize(clearance=self.total_clearance)
+        self.clearance_mask = np.logical_and(self.bloated_mask, np.logical_not(self.hard_mask))
 
     def _build_project02_geometry(self, text: str) -> Tuple[List[Rect], List[EllipseRing], List[Polygon]]:
         rects: List[Rect] = []
@@ -425,6 +430,139 @@ def backward_astar(start: State, goal: State, obstacle_map: ObstacleMap, step_si
     return SearchResult(False, [], explored_edges, runtime, explored_count, None)
 
 
+def map_to_image_xy(x: float, y: float, scale: int) -> Tuple[int, int]:
+    ix = int(round(x * scale))
+    iy = int(round((MAP_HEIGHT - 1 - y) * scale))
+    return ix, iy
+
+
+class Visualizer:
+    def __init__(self, obstacle_map: ObstacleMap, scale: int = DEFAULT_SCALE):
+        self.map = obstacle_map
+        self.scale = max(1, int(scale))
+        self.base_canvas = self._build_base_canvas()
+
+    def _build_base_canvas(self) -> np.ndarray:
+        canvas = np.full((MAP_HEIGHT * self.scale, MAP_WIDTH * self.scale, 3), 245, dtype=np.uint8)
+        free_color = np.array([245, 245, 245], dtype=np.uint8)
+        clearance_color = np.array([222, 236, 255], dtype=np.uint8)
+        obstacle_color = np.array([140, 110, 45], dtype=np.uint8)
+
+        for y in range(MAP_HEIGHT):
+            for x in range(MAP_WIDTH):
+                if self.map.hard_mask[y, x]:
+                    color = obstacle_color
+                elif self.map.clearance_mask[y, x]:
+                    color = clearance_color
+                else:
+                    color = free_color
+                ix, iy = map_to_image_xy(float(x), float(y), self.scale)
+                canvas[iy : iy + self.scale, ix : ix + self.scale] = color
+
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), (60, 60, 60), 1)
+        return canvas
+
+    def _draw_state(self, image: np.ndarray, state: State, color: Tuple[int, int, int], radius_scale: float = 0.45) -> None:
+        ix, iy = map_to_image_xy(state.x, state.y, self.scale)
+        center = (ix + self.scale // 2, iy + self.scale // 2)
+        cv2.circle(image, center, max(1, int(self.scale * radius_scale)), color, -1, lineType=cv2.LINE_AA)
+
+    def _draw_line(self, image: np.ndarray, start: State, end: State, color: Tuple[int, int, int], thickness: int) -> None:
+        pt1 = map_to_image_xy(start.x, start.y, self.scale)
+        pt2 = map_to_image_xy(end.x, end.y, self.scale)
+        cv2.line(image, pt1, pt2, color, thickness, lineType=cv2.LINE_AA)
+
+    def _draw_header(self, image: np.ndarray, lines: Sequence[str]) -> None:
+        for row, text in enumerate(lines):
+            cv2.putText(image, text, (10, 24 + 24 * row), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, lineType=cv2.LINE_AA)
+
+    def _draw_legend(self, image: np.ndarray) -> None:
+        x0, y0, x1, y1 = 10, 100, 340, 265
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (252, 252, 252), -1)
+        cv2.addWeighted(overlay, 0.90, image, 0.10, 0.0, image)
+        cv2.rectangle(image, (x0, y0), (x1, y1), (60, 60, 60), 1)
+        cv2.putText(image, "Legend", (x0 + 10, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 1)
+
+        items = [
+            ((245, 245, 245), "Free space"),
+            ((222, 236, 255), "Clearance space"),
+            ((140, 110, 45), "Obstacle / wall"),
+            ((90, 90, 220), "Explored motions"),
+            ((128, 14, 67), "Optimal path"),
+            ((30, 30, 220), "Start"),
+            ((30, 170, 30), "Goal"),
+        ]
+        y = y0 + 48
+        for color, label in items:
+            cv2.rectangle(image, (x0 + 12, y - 10), (x0 + 32, y + 10), color, -1)
+            cv2.rectangle(image, (x0 + 12, y - 10), (x0 + 32, y + 10), (50, 50, 50), 1)
+            cv2.putText(image, label, (x0 + 42, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1)
+            y += 20
+
+    def render_video(
+        self,
+        result: SearchResult,
+        start: State,
+        goal: State,
+        output_path: str,
+        fps: int = DEFAULT_FPS,
+        exploration_stride: Optional[int] = None,
+        path_repeat: int = 3,
+    ) -> None:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        writer = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(1, int(fps)),
+            (self.base_canvas.shape[1], self.base_canvas.shape[0]),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for: {output_path}")
+
+        frame = self.base_canvas.copy()
+        self._draw_state(frame, start, (30, 30, 220), 0.48)
+        self._draw_state(frame, goal, (30, 170, 30), 0.48)
+        self._draw_header(
+            frame,
+            [
+                f"Backward A* | text={self.map.text}",
+                f"start=({start.x:.1f}, {start.y:.1f}, {start.theta_deg}) goal=({goal.x:.1f}, {goal.y:.1f}, {goal.theta_deg})",
+                f"explored={result.explored_count} runtime={result.runtime_sec:.6f}s",
+            ],
+        )
+        self._draw_legend(frame)
+
+        for _ in range(max(1, fps)):
+            writer.write(frame)
+
+        explored_frame = frame.copy()
+        if exploration_stride is None:
+            exploration_stride = max(1, len(result.explored_edges) // 1200)
+        for idx, (edge_start, edge_end) in enumerate(result.explored_edges):
+            self._draw_line(explored_frame, edge_start, edge_end, (90, 90, 220), max(1, self.scale // 2))
+            if idx % max(1, exploration_stride) == 0 or idx == len(result.explored_edges) - 1:
+                writer.write(explored_frame)
+
+        if result.found:
+            path_frame = explored_frame.copy()
+            for node_a, node_b in zip(result.path[:-1], result.path[1:]):
+                self._draw_line(path_frame, node_a, node_b, (128, 14, 67), max(1, self.scale))
+                self._draw_state(path_frame, node_a, (128, 14, 67), 0.25)
+                self._draw_state(path_frame, node_b, (128, 14, 67), 0.25)
+                for _ in range(max(1, path_repeat)):
+                    writer.write(path_frame)
+            for _ in range(max(1, fps)):
+                writer.write(path_frame)
+        else:
+            no_path = explored_frame.copy()
+            cv2.putText(no_path, "No path found.", (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1)
+            for _ in range(max(1, fps)):
+                writer.write(no_path)
+
+        writer.release()
+
+
 def validate_state(state: State, obstacle_map: ObstacleMap, name: str) -> None:
     if not obstacle_map.is_in_bounds(state.x, state.y):
         raise ValueError(f"{name} must lie inside the map bounds.")
@@ -472,13 +610,17 @@ def ask_positive_value(prompt: str, preset: Optional[float], low: float, high: f
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backward A* search for ENPM661 Project 03 - Phase 1")
+    parser = argparse.ArgumentParser(description="Backward A* with visualization for ENPM661 Project 03 - Phase 1")
     parser.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="start state")
     parser.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="goal state")
     parser.add_argument("--robot-radius", type=float, default=DEFAULT_ROBOT_RADIUS, help="robot radius in map units")
     parser.add_argument("--clearance", type=float, default=DEFAULT_CLEARANCE, help="desired obstacle clearance in map units")
     parser.add_argument("--step-size", type=float, default=DEFAULT_STEP_SIZE, help="step size, 1 <= L <= 10")
-    parser.add_argument("--text", type=str, default=DEFAULT_TEXT, help="Text obstacle string")
+    parser.add_argument("--text", type=str, default=DEFAULT_TEXT, help="Project 02 text obstacle string")
+    parser.add_argument("--video", type=str, default=None, help="output MP4 path")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="video frame rate")
+    parser.add_argument("--scale", type=int, default=DEFAULT_SCALE, help="pixels per map cell in the output video")
+    parser.add_argument("--no-video", action="store_true", help="skip video generation")
     return parser
 
 
@@ -530,6 +672,17 @@ def run() -> int:
         print("Path:")
         for state in result.path:
             print(f"({state.x:.2f}, {state.y:.2f}, {state.theta_deg})")
+
+    if not args.no_video:
+        output_path = args.video
+        if output_path is None:
+            output_path = os.path.abspath(
+                f"proj3_backward_astar_{int(start.x)}_{int(start.y)}_{start.theta_deg}_"
+                f"{int(goal.x)}_{int(goal.y)}_{goal.theta_deg}.mp4"
+            )
+        visualizer = Visualizer(obstacle_map, scale=max(1, args.scale))
+        visualizer.render_video(result, start, goal, output_path, fps=max(1, args.fps))
+        print(f"Saved video         : {output_path}")
 
     return 0
 
