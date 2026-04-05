@@ -3,6 +3,11 @@
 
 This submission contains a backward A* implementation for the Project 03 Phase 1 motion-planning problem.
 
+Team-
+Aanya Loomba 122298880
+Ryan Lowe 122258389
+Anvesh Som 122298682
+
 ## Included files
 - `a_star_aanya_ryan_anvesh.py` - source code
 - `output.mp4` - example animation showing exploration and final path
