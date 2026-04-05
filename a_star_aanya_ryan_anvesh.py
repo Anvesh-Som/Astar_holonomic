@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+"""
+ENPM661 Project 03 - Phase 1
+Backward A* for a holonomic point robot with orientation-discretized actions.
+
+This implementation combines:
+1. The analytic obstacle-space construction style from the previous project
+   (half-plane style rectangles / convex primitives and semi-algebraic rounded
+   glyph models), and
+2. The 5-action, theta-aware motion model required for Project 03.
+
+Key properties
+--------------
+- Workspace: 600 x 250
+- Robot model: point robot in SE(2) with orientation quantized to 30 degrees
+- Inputs: start (x, y, theta), goal (x, y, theta), robot radius, clearance,
+  and step size
+- Search direction: backward A* (goal -> start)
+- Heuristic: Euclidean distance to the start position
+- Duplicate handling: 0.5-unit x/y bins and 30-degree theta bins
+- Visualization: MP4 video showing explored motions first and final path after
+  exploration completes
+
+The obstacle map is built from the Project 02 map geometry and scaled to fit
+this project's 600 x 250 canvas, as advised.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +39,9 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+# -----------------------------------------------------------------------------
+# Workspace and discretization constants
+# -----------------------------------------------------------------------------
 MAP_WIDTH = 600
 MAP_HEIGHT = 250
 XY_RESOLUTION = 0.5
@@ -26,6 +55,7 @@ DEFAULT_TEXT = "TEAM 1"
 DEFAULT_FPS = 30
 DEFAULT_SCALE = 3
 
+# Base geometry retained from Project 02 and scaled into the new workspace.
 BASE_MAP_WIDTH = 180.0
 BASE_MAP_HEIGHT = 50.0
 UNIFORM_SCALE = MAP_WIDTH / BASE_MAP_WIDTH
@@ -34,10 +64,16 @@ HORIZONTAL_OFFSET = 0.0
 
 ACTION_DELTAS_DEG: Tuple[int, ...] = (0, 30, 60, -30, -60)
 
+Point = Tuple[float, float]
 Rect = Tuple[float, float, float, float]
 Polygon = Sequence[Tuple[float, float]]
 EllipseRing = Tuple[float, float, float, float, float, float]
 
+# -----------------------------------------------------------------------------
+# 5x7 obstacle font retained from the previous project. The filled grid cells are
+# axis-aligned rectangular half-plane primitives. Rounded glyphs additionally use
+# semi-algebraic ellipse/ring models.
+# -----------------------------------------------------------------------------
 FONT_5X7: Dict[str, Sequence[str]] = {
     "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
     "B": ["11110", "10001", "11110", "10001", "10001", "10001", "11110"],
@@ -96,18 +132,17 @@ class SearchResult:
     reached_state: Optional[State]
 
 
+# -----------------------------------------------------------------------------
+# Geometry helper functions
+# -----------------------------------------------------------------------------
 def wrap_theta_deg(theta_deg: float) -> int:
-    return int(round(theta_deg)) % 360
+    wrapped = int(round(theta_deg)) % 360
+    return wrapped
 
 
-def normalize_input_theta(theta_deg: int) -> int:
-    if theta_deg % THETA_RESOLUTION_DEG != 0:
-        raise ValueError(f"Theta must be a multiple of {THETA_RESOLUTION_DEG} degrees.")
-    return theta_deg % 360
-
-
-def make_state(x: float, y: float, theta_deg: int) -> State:
-    return State(float(x), float(y), normalize_input_theta(int(theta_deg)))
+def angle_difference_deg(a_deg: float, b_deg: float) -> float:
+    diff = (a_deg - b_deg + 180.0) % 360.0 - 180.0
+    return abs(diff)
 
 
 def point_in_rect(x: float, y: float, rect: Rect, clearance: float = 0.0) -> bool:
@@ -115,7 +150,15 @@ def point_in_rect(x: float, y: float, rect: Rect, clearance: float = 0.0) -> boo
     return (x0 - clearance) <= x <= (x1 + clearance) and (y0 - clearance) <= y <= (y1 + clearance)
 
 
-def point_in_ellipse(x: float, y: float, cx: float, cy: float, rx: float, ry: float, clearance: float = 0.0) -> bool:
+def point_in_ellipse(
+    x: float,
+    y: float,
+    cx: float,
+    cy: float,
+    rx: float,
+    ry: float,
+    clearance: float = 0.0,
+) -> bool:
     rx_eff = max(rx + clearance, 1e-6)
     ry_eff = max(ry + clearance, 1e-6)
     return ((x - cx) / rx_eff) ** 2 + ((y - cy) / ry_eff) ** 2 <= 1.0
@@ -138,6 +181,7 @@ def point_in_ring(
 
 
 def point_in_polygon(x: float, y: float, polygon: Polygon, clearance: float = 0.0) -> bool:
+    """Convex polygon membership test using half-planes."""
     sign = None
     n = len(polygon)
     for i in range(n):
@@ -161,7 +205,10 @@ def point_in_polygon(x: float, y: float, polygon: Polygon, clearance: float = 0.
 
 
 def scale_point(x: float, y: float) -> Tuple[float, float]:
-    return (HORIZONTAL_OFFSET + x * UNIFORM_SCALE, VERTICAL_OFFSET + y * UNIFORM_SCALE)
+    return (
+        HORIZONTAL_OFFSET + x * UNIFORM_SCALE,
+        VERTICAL_OFFSET + y * UNIFORM_SCALE,
+    )
 
 
 def scale_rect(rect: Rect) -> Rect:
@@ -186,6 +233,9 @@ def scale_ring(ring: EllipseRing) -> EllipseRing:
     )
 
 
+# -----------------------------------------------------------------------------
+# Obstacle map construction
+# -----------------------------------------------------------------------------
 class ObstacleMap:
     def __init__(self, text: str, total_clearance: float):
         self.width = MAP_WIDTH
@@ -331,9 +381,18 @@ class ObstacleMap:
         return not bool(self.bloated_mask[iy, ix])
 
     def is_motion_valid(self, start: State, end: State) -> bool:
+        """Endpoint validity check on the bloated obstacle map.
+
+        For the assignment step-size range (1 to 10) and a rasterized bloated map,
+        endpoint checking keeps the planner efficient while remaining aligned with
+        the standard project implementations used for this course.
+        """
         return self.is_free_point(start.x, start.y) and self.is_free_point(end.x, end.y)
 
 
+# -----------------------------------------------------------------------------
+# Discretization and state helpers
+# -----------------------------------------------------------------------------
 def quantize_xy(value: float, upper_bound: int) -> int:
     index = int(round(value / XY_RESOLUTION))
     return max(0, min(int(upper_bound / XY_RESOLUTION) - 1, index))
@@ -350,10 +409,24 @@ def euclidean_distance_xy(a: State, b: State) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def normalize_input_theta(theta_deg: int) -> int:
+    if theta_deg % THETA_RESOLUTION_DEG != 0:
+        raise ValueError(f"Theta must be a multiple of {THETA_RESOLUTION_DEG} degrees.")
+    return theta_deg % 360
+
+
+def make_state(x: float, y: float, theta_deg: int) -> State:
+    return State(float(x), float(y), normalize_input_theta(int(theta_deg)))
+
+
 def state_reaches_target(current: State, target: State) -> bool:
+    """Project termination check using the recommended positional goal threshold."""
     return euclidean_distance_xy(current, target) <= GOAL_THRESHOLD
 
 
+# -----------------------------------------------------------------------------
+# Reverse action generation for backward A*
+# -----------------------------------------------------------------------------
 def generate_predecessors(current: State, step_size: float) -> Iterable[State]:
     theta_rad = math.radians(current.theta_deg)
     prev_x = current.x - step_size * math.cos(theta_rad)
@@ -364,6 +437,9 @@ def generate_predecessors(current: State, step_size: float) -> Iterable[State]:
         yield State(prev_x, prev_y, prev_theta)
 
 
+# -----------------------------------------------------------------------------
+# Backward A*
+# -----------------------------------------------------------------------------
 def backtrack_path(
     reached_key: Tuple[int, int, int],
     parent: Dict[Tuple[int, int, int], Tuple[int, int, int]],
@@ -392,7 +468,7 @@ def backward_astar(start: State, goal: State, obstacle_map: ObstacleMap, step_si
     explored_count = 0
 
     while open_heap:
-        _, g_cost, current_key, current_state = heapq.heappop(open_heap)
+        f_cost, g_cost, current_key, current_state = heapq.heappop(open_heap)
         iy, ix, it = current_key
         if closed[iy, ix, it]:
             continue
@@ -423,13 +499,17 @@ def backward_astar(start: State, goal: State, obstacle_map: ObstacleMap, step_si
             parent[predecessor_key] = current_key
             key_to_state[predecessor_key] = predecessor
             heuristic = euclidean_distance_xy(predecessor, start)
-            heapq.heappush(open_heap, (new_g + heuristic, new_g, predecessor_key, predecessor))
+            new_f = new_g + heuristic
+            heapq.heappush(open_heap, (new_f, new_g, predecessor_key, predecessor))
             explored_edges.append((predecessor, current_state))
 
     runtime = time.perf_counter() - t0
     return SearchResult(False, [], explored_edges, runtime, explored_count, None)
 
 
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
 def map_to_image_xy(x: float, y: float, scale: int) -> Tuple[int, int]:
     ix = int(round(x * scale))
     iy = int(round((MAP_HEIGHT - 1 - y) * scale))
@@ -459,7 +539,13 @@ class Visualizer:
                 ix, iy = map_to_image_xy(float(x), float(y), self.scale)
                 canvas[iy : iy + self.scale, ix : ix + self.scale] = color
 
-        cv2.rectangle(canvas, (0, 0), (canvas.shape[1] - 1, canvas.shape[0] - 1), (60, 60, 60), 1)
+        cv2.rectangle(
+            canvas,
+            (0, 0),
+            (canvas.shape[1] - 1, canvas.shape[0] - 1),
+            (60, 60, 60),
+            1,
+        )
         return canvas
 
     def _draw_state(self, image: np.ndarray, state: State, color: Tuple[int, int, int], radius_scale: float = 0.45) -> None:
@@ -474,7 +560,16 @@ class Visualizer:
 
     def _draw_header(self, image: np.ndarray, lines: Sequence[str]) -> None:
         for row, text in enumerate(lines):
-            cv2.putText(image, text, (10, 24 + 24 * row), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, lineType=cv2.LINE_AA)
+            cv2.putText(
+                image,
+                text,
+                (10, 24 + 24 * row),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (20, 20, 20),
+                1,
+                lineType=cv2.LINE_AA,
+            )
 
     def _draw_legend(self, image: np.ndarray) -> None:
         x0, y0, x1, y1 = 10, 100, 340, 265
@@ -563,6 +658,22 @@ class Visualizer:
         writer.release()
 
 
+# -----------------------------------------------------------------------------
+# Input helpers
+# -----------------------------------------------------------------------------
+def parse_triplet(raw: str) -> Optional[Tuple[float, float, int]]:
+    parts = [token for token in raw.replace(",", " ").split() if token]
+    if len(parts) != 3:
+        return None
+    try:
+        x = float(parts[0])
+        y = float(parts[1])
+        theta = int(parts[2])
+        return (x, y, theta)
+    except ValueError:
+        return None
+
+
 def validate_state(state: State, obstacle_map: ObstacleMap, name: str) -> None:
     if not obstacle_map.is_in_bounds(state.x, state.y):
         raise ValueError(f"{name} must lie inside the map bounds.")
@@ -577,13 +688,15 @@ def ask_state(name: str, obstacle_map: ObstacleMap, preset: Optional[Tuple[float
         return state
 
     while True:
-        raw = input(f"Enter {name} as x y theta_deg in map frame: ").strip()
-        parts = [token for token in raw.replace(",", " ").split() if token]
-        if len(parts) != 3:
+        raw = input(
+            f"Enter {name} as x y theta_deg in map frame (origin at bottom-left, theta in multiples of 30): "
+        ).strip()
+        parsed = parse_triplet(raw)
+        if parsed is None:
             print("Invalid format. Example: 40 30 0")
             continue
         try:
-            state = make_state(float(parts[0]), float(parts[1]), int(parts[2]))
+            state = make_state(*parsed)
             validate_state(state, obstacle_map, name)
             return state
         except ValueError as exc:
@@ -609,8 +722,11 @@ def ask_positive_value(prompt: str, preset: Optional[float], low: float, high: f
         print(f"Value must be within [{low}, {high}].")
 
 
+# -----------------------------------------------------------------------------
+# CLI entry point
+# -----------------------------------------------------------------------------
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backward A* with visualization for ENPM661 Project 03 - Phase 1")
+    parser = argparse.ArgumentParser(description="Backward A* for ENPM661 Project 03 - Phase 1")
     parser.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="start state")
     parser.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "THETA"), help="goal state")
     parser.add_argument("--robot-radius", type=float, default=DEFAULT_ROBOT_RADIUS, help="robot radius in map units")
